@@ -1,6 +1,8 @@
+# never commit secrets
 .env
+# python cache
 __pycache__/
 *.pyc
 *.pyo
+# OS junk
 *.DS_Store
-
