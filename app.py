@@ -140,8 +140,10 @@ with st.expander("Sample CSV you can paste into a file and upload"):
 Save the following as **sample_claims.csv** on your computer, then upload it above.
 
 with st.expander("CSV schema & tips"):
-    st.markdown("""
+    st.markdown(
+        """
 - Dates: ISO format recommended (YYYY-MM-DD)  
 - `place_of_service`: **11**=office, **22**=outpatient, **21**=inpatient  
 - For best results, include realistic ranges for **amount** and **units**.  
-    """)
+        """
+    )
