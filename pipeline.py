@@ -169,7 +169,21 @@ def score_claims(csv_path, use_llm=False, llm_provider="openai", top_k=50):
         top = base_df.sort_values("risk_score", ascending=False).head(min(top_k, len(base_df)))
         cols = ["claim_id","provider_id","member_id","service_date","cpt_code","units","amount",
                 "z_amt_vs_prov","z_amt_vs_cpt","ratio_units_vs_cpt","is_weekend","modifier","reasons"]
-        rows = [{c: (r[c] if not pd.isna(r[c]) else None) for c in cols} for _, r in top[cols].iterrows()]
+        # Make a copy of just the columns we need
+top_small = top[cols].copy()
+
+# Convert NaN/NaT to None safely (works for strings, numbers, lists)
+top_small = top_small.where(pd.notna(top_small), None)
+
+# Ensure 'reasons' is JSON-serializable (always a list)
+if "reasons" in top_small.columns:
+    top_small["reasons"] = top_small["reasons"].apply(
+        lambda x: x if isinstance(x, list) else ([] if x is None else [str(x)])
+    )
+
+# Convert rows to plain dicts for the LLM
+rows = top_small.to_dict(orient="records")
+
         if llm_provider == "openai":
             out = llm_explain_openai(rows)
         else:
