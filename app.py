@@ -1,129 +1,107 @@
 import streamlit as st
 import pandas as pd
-import numpy as np
-from dateutil.parser import isoparse
-from sklearn.ensemble import IsolationForest
-from sklearn.preprocessing import RobustScaler
-import traceback
+import tempfile
+from pipeline import score_claims
 
-st.set_page_config(page_title="FraudIntel — Minimal Demo", layout="wide")
-st.title("FraudIntel — Minimal Claims Risk Demo")
+st.set_page_config(page_title="FraudIntel Demo", layout="wide")
+st.title("Healthcare Fraud & Denial Intelligence — Demo")
 
-st.write("Upload a **CSV** with these columns (no PHI): "
-         "`claim_id, member_id, provider_id, service_date, cpt_code, dx_code, place_of_service, units, amount, modifier`.")
+st.write(
+    "Upload a claims CSV (no PHI). Required columns: "
+    "`claim_id, member_id, provider_id, service_date, cpt_code, dx_code, place_of_service, units, amount, modifier`."
+)
 
-# ---------- helpers ----------
-def _safe_dt(x):
-    try:
-        return isoparse(str(x)).date()
-    except Exception:
-        return pd.NaT
+# --- Optional: LLM explanations (off by default to avoid API costs) ---
+col1, col2 = st.columns(2)
+with col1:
+    use_llm = st.toggle("Add LLM explanations for top flagged claims (optional; uses API credits)", value=False)
+with col2:
+    llm_provider = st.selectbox("LLM provider", ["openai", "anthropic"])
 
-def featurize(df: pd.DataFrame):
-    df = df.copy()
+# --- File upload OR use demo data ---
+file = st.file_uploader("Upload CSV", type=["csv"])
+use_demo = st.button("Or click here to try with demo data (synthetic)")
 
-    # basic types
-    df["service_date"] = df["service_date"].apply(_safe_dt)
-    df["dow"] = df["service_date"].apply(lambda d: d.weekday() if pd.notna(d) else -1)
-    df["is_weekend"] = df["dow"].isin([5,6]).astype(int)
+def make_demo_df(n=3000):
+    import numpy as np, random, datetime as dt
+    rng = np.random.default_rng(7)
+    CPT = ["99213","99214","93000","80050","97110","97012","36415","J1885"]
+    DX  = ["E11.9","I10","M54.5","J06.9","K21.9"]
+    prov = [f"P{n:03d}" for n in range(1,21)]
+    mem  = [f"M{n:05d}" for n in range(1,801)]
+    rows=[]
+    start=dt.date(2025,1,1)
+    for i in range(n):
+        p = random.choice(prov)
+        m = random.choice(mem)
+        d = start + dt.timedelta(days=int(rng.integers(0,120)))
+        cpt = random.choice(CPT)
+        units = max(1, int(abs(rng.normal(1.5,0.8))))
+        base = {"99213":95,"99214":140,"93000":55,"80050":110,"97110":45,"97012":38,"36415":10,"J1885":25}[cpt]
+        amt = round(max(10, float(rng.normal(base*units, base*0.25))), 2)
+        mod = random.choice(["","25","59","76","80"])
+        pos = random.choice(["11","22","21"])  # office, outpatient, inpatient
+        dx  = random.choice(DX)
+        rows.append([f"C{i:06d}", m, p, d.isoformat(), cpt, dx, pos, units, amt, mod])
 
-    # numeric
-    df["units"] = pd.to_numeric(df["units"], errors="coerce").fillna(0)
-    df["amount"] = pd.to_numeric(df["amount"], errors="coerce").fillna(0.0)
+    # add some anomalies
+    for _ in range(30):
+        i = int(rng.integers(0, len(rows)))
+        rows[i][7] = int(rows[i][7] * int(rng.integers(6, 10)))       # units spike
+    for _ in range(25):
+        i = int(rng.integers(0, len(rows)))
+        rows[i][8] = round(rows[i][8] * float(rng.uniform(4.0, 8.0)), 2)  # amount spike
 
-    # provider stats
-    gP = df.groupby("provider_id").agg(
-        prov_amt_median=("amount","median"),
-        prov_amt_p90=("amount", lambda s: np.percentile(s,90) if len(s)>0 else 0),
-        prov_units_median=("units","median"),
-        prov_claims=("claim_id","count")
-    )
-    df = df.join(gP, on="provider_id")
+    return pd.DataFrame(rows, columns=[
+        "claim_id","member_id","provider_id","service_date","cpt_code",
+        "dx_code","place_of_service","units","amount","modifier"
+    ])
 
-    # CPT stats
-    gC = df.groupby("cpt_code").agg(
-        cpt_amt_median=("amount","median"),
-        cpt_units_median=("units","median"),
-        cpt_count=("claim_id","count")
-    )
-    df = df.join(gC, on="cpt_code")
+df_in = None
+if file is not None:
+    df_in = pd.read_csv(file)
 
-    # provider–CPT rarity
-    gPC = df.groupby(["provider_id","cpt_code"]).agg(pcpt_count=("claim_id","count"))
-    df = df.merge(gPC, on=["provider_id","cpt_code"], how="left")
+if df_in is None and use_demo:
+    df_in = make_demo_df()
 
-    # same-day member density
-    gMD = df.groupby(["member_id","service_date"]).size().rename("member_day_claims")
-    df = df.join(gMD, on=["member_id","service_date"])
-    df["member_day_claims"] = df["member_day_claims"].fillna(1)
+if df_in is not None:
+    with st.spinner("Scoring claims..."):
+        # Write to a temp CSV so the pipeline (file-based) can read it
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".csv") as tmp:
+            df_in.to_csv(tmp.name, index=False)
+            result = score_claims(
+                tmp.name,
+                use_llm=use_llm,
+                llm_provider=llm_provider,
+                top_k=50
+            )
 
-    # features
-    eps = 1e-6
-    df["z_amt_vs_prov"] = (df["amount"] - df["prov_amt_median"]) / (df["prov_amt_p90"]-df["prov_amt_median"] + eps)
-    df["z_amt_vs_cpt"]  = (df["amount"] - df["cpt_amt_median"]) / (df["cpt_amt_median"] + 5.0)
-    df["ratio_units_vs_prov"] = (df["units"]+1)/(df["prov_units_median"]+1)
-    df["ratio_units_vs_cpt"]  = (df["units"]+1)/(df["cpt_units_median"]+1)
-
-    df["rare_pcpt"] = (df["pcpt_count"].fillna(0) < 3).astype(int)
-    df["mod_59_or_25"] = df["modifier"].astype(str).isin(["59","25"]).astype(int)
-    df["pos_office"] = (df["place_of_service"].astype(str)=="11").astype(int)
-    df["pos_outpt"]  = (df["place_of_service"].astype(str)=="22").astype(int)
-
-    feats = [
-        "is_weekend","units","amount","prov_claims","cpt_count","member_day_claims",
-        "z_amt_vs_prov","z_amt_vs_cpt","ratio_units_vs_prov","ratio_units_vs_cpt",
-        "rare_pcpt","mod_59_or_25","pos_office","pos_outpt"
+    st.success("Done. Showing top results by risk_score.")
+    cols_to_show = [
+        "claim_id","provider_id","member_id","service_date","cpt_code",
+        "units","amount","risk_score","reasons","llm_deny_reason",
+        "llm_confidence","llm_rationale"
     ]
-    X = df[feats].fillna(0).astype(float)
-    return df, X
+    show = [c for c in cols_to_show if c in result.columns]
+    st.dataframe(result[show].head(500), use_container_width=True)
 
-def heuristic_reasons(row):
-    reasons=[]
-    if row["z_amt_vs_prov"]>1.2: reasons.append("Amount far above provider norm")
-    if row["ratio_units_vs_cpt"]>3: reasons.append("Unusually high units for CPT")
-    if row["member_day_claims"]>3: reasons.append("Many same-day claims for member")
-    if row["is_weekend"]==1 and row["pos_office"]==1: reasons.append("Office service on weekend")
-    if row["mod_59_or_25"]==1 and row["ratio_units_vs_cpt"]>2: reasons.append("Modifier 25/59 with high units (possible unbundling)")
-    if row["rare_pcpt"]==1: reasons.append("Rare provider–CPT combo")
-    return reasons[:3]
+    # Safe download (make sure parentheses are fully closed!)
+    csv_bytes = result.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        label="Download results CSV",
+        data=csv_bytes,
+        file_name="fraudintel_results.csv",
+        mime="text/csv"
+    )
 
-def score_anomalies(X: pd.DataFrame):
-    scaler = RobustScaler()
-    Xs = scaler.fit_transform(X)
-    model = IsolationForest(n_estimators=200, contamination="auto", random_state=42)
-    model.fit(Xs)
-    raw = -model.score_samples(Xs)            # higher = more anomalous
-    # normalize 0..100
-    rmin, rmax = float(raw.min()), float(raw.max())
-    if rmax - rmin < 1e-12:
-        return np.zeros_like(raw)
-    return 100.0*(raw - rmin)/(rmax - rmin)
+with st.expander("CSV schema & tips"):
+    st.markdown(
+        "- Dates: ISO format recommended (YYYY-MM-DD)\n"
+        "- `place_of_service`: **11**=office, **22**=outpatient, **21**=inpatient\n"
+        "- For best results, include realistic ranges for **amount** and **units**.\n"
+        "- LLM explanations are optional; leave off if you don’t have API keys."
+    )
 
-# ---------- UI ----------
-file = st.file_uploader("Upload claims CSV", type=["csv"])
-
-if file:
-    try:
-        with st.spinner("Scoring claims..."):
-            df = pd.read_csv(file)
-            # quick schema check
-            required = {"claim_id","member_id","provider_id","service_date","cpt_code","dx_code","place_of_service","units","amount","modifier"}
-            missing = required - set(map(str.lower, df.columns))
-            if missing:
-                st.error(f"Your CSV is missing columns: {', '.join(sorted(missing))}")
-            else:
-                # Normalize column names to lower to be forgiving
-                df.columns = [c.lower() for c in df.columns]
-                base, X = featurize(df)
-                base["risk_score"] = score_anomalies(X)
-                base["reasons"] = base.apply(heuristic_reasons, axis=1)
-                out = base.sort_values("risk_score", ascending=False)
-
-                st.success("Done. Showing top 300 by risk.")
-                st.dataframe(out[["claim_id","provider_id","member_id","service_date","cpt_code",
-                                  "units","amount","risk_score","reasons"]].head(300),
-                             use_container_width=True)
-                st.download_button(
                   with st.expander("CSV schema & tips"):
     st.markdown(
         """
