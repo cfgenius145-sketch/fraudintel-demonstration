@@ -19,10 +19,36 @@ with col2:
 file = st.file_uploader("Upload CSV", type=["csv"])
 
 if file:
-    with st.spinner("Scoring claims..."):
-        df_in = pd.read_csv(file)
-        tmp = "/tmp/_claims.csv"; df_in.to_csv(tmp, index=False)
-        result = score_claims(tmp, use_llm=use_llm, llm_provider=llm_provider, top_k=50)
+    try:
+        with st.spinner("Scoring claims..."):
+            import os, platform, sys
+            st.caption(f"Debug: Python {platform.python_version()} | pid {os.getpid()}")
+
+            df_in = pd.read_csv(file)
+            tmp = "/tmp/_claims.csv"; df_in.to_csv(tmp, index=False)
+
+            # run the pipeline
+            result = score_claims(tmp, use_llm=use_llm, llm_provider=llm_provider, top_k=50)
+
+        st.success("Done.")
+        st.caption("Sorted by risk_score (0–100). Use the download button below to export.")
+        st.dataframe(
+            result[["claim_id","provider_id","member_id","service_date","cpt_code",
+                    "units","amount","risk_score","reasons","llm_deny_reason","llm_confidence","llm_rationale"]]
+            .fillna("").head(500),
+            use_container_width=True
+        )
+        st.download_button(
+            "Download results CSV",
+            result.to_csv(index=False).encode("utf-8"),
+            file_name="fraudintel_results.csv",
+            mime="text/csv"
+        )
+    except Exception as e:
+        import traceback
+        st.error("Something broke. Copy this error and paste it to me:")
+        st.code("".join(traceback.format_exception(e)))
+
 
     st.success("Done.")
     st.caption("Sorted by risk_score (0–100). Use the download button below to export.")
