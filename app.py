@@ -124,22 +124,7 @@ if file:
                                   "units","amount","risk_score","reasons"]].head(300),
                              use_container_width=True)
                 st.download_button(
-                    "Download results CSV",
-                    out.to_csv(index=False).encode("utf-8"),
-                    file_name="fraudintel_results.csv",
-                    mime="text/csv"
-                )
-    except Exception as e:
-        st.error("Something broke. Copy this error and paste it to me:")
-        st.code("".join(traceback.format_exception(e)))
-else:
-    st.info("Tip: if you don't have data handy, paste in the sample CSV from the instructions below.")
-
-with st.expander("Sample CSV you can paste into a file and upload"):
-    st.markdown("""
-Save the following as **sample_claims.csv** on your computer, then upload it above.
-
-with st.expander("CSV schema & tips"):
+                  with st.expander("CSV schema & tips"):
     st.markdown(
         """
 - Dates: ISO format recommended (YYYY-MM-DD)  
