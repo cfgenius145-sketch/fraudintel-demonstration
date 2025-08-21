@@ -1,6 +1,5 @@
 import os, json
 import pandas as pd, numpy as np
-from dateutil.parser import isoparse
 from sklearn.ensemble import IsolationForest
 from sklearn.preprocessing import RobustScaler
 from dotenv import load_dotenv
@@ -8,23 +7,17 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ---------- Feature engineering ----------
-def _safe_dt(x):
-    try:
-        return isoparse(str(x)).date()
-    except Exception:
-        return pd.NaT
-
 def featurize(df: pd.DataFrame):
     df = df.copy()
 
-    # basic types
-    df["service_date"] = df["service_date"].apply(_safe_dt)
-    df["dow"] = df["service_date"].apply(lambda d: d.weekday() if pd.notna(d) else -1)
-    df["is_weekend"] = (df["dow"].isin([5, 6])).astype(int)
-    df["units"] = pd.to_numeric(df["units"], errors="coerce").fillna(0)
-    df["amount"] = pd.to_numeric(df["amount"], errors="coerce").fillna(0.0)
+    # types & basics
+    df["service_date"] = pd.to_datetime(df["service_date"], errors="coerce")
+    df["dow"] = df["service_date"].dt.weekday.fillna(-1).astype(int)
+    df["is_weekend"] = df["dow"].isin([5, 6]).astype(int)
+    df["units"] = pd.to_numeric(df["units"], errors="coerce").fillna(0).astype(float)
+    df["amount"] = pd.to_numeric(df["amount"], errors="coerce").fillna(0.0).astype(float)
 
-    # provider stats
+    # provider-level stats
     grpP = df.groupby("provider_id").agg(
         prov_amt_median=("amount","median"),
         prov_amt_p90=("amount", lambda s: np.percentile(s,90) if len(s)>0 else 0),
@@ -33,7 +26,7 @@ def featurize(df: pd.DataFrame):
     )
     df = df.join(grpP, on="provider_id")
 
-    # cpt stats
+    # CPT-level stats (global)
     grpC = df.groupby("cpt_code").agg(
         cpt_amt_median=("amount","median"),
         cpt_units_median=("units","median"),
@@ -41,7 +34,7 @@ def featurize(df: pd.DataFrame):
     )
     df = df.join(grpC, on="cpt_code")
 
-    # provider–cpt stats
+    # provider–CPT pair stats
     grpPC = df.groupby(["provider_id","cpt_code"]).agg(
         pcpt_amt_median=("amount","median"),
         pcpt_units_median=("units","median"),
@@ -57,7 +50,7 @@ def featurize(df: pd.DataFrame):
     # derived features
     eps = 1e-6
     df["z_amt_vs_prov"] = (df["amount"] - df["prov_amt_median"]) / (df["prov_amt_p90"] - df["prov_amt_median"] + eps)
-    df["z_amt_vs_cpt"]  = (df["amount"] - df["cpt_amt_median"]) / (df["cpt_amt_median"] + 5.0)
+    df["z_amt_vs_cpt"]  = (df["amount"] - df["cpt_amt_median"]) / (df["cpt_amt_median"] + 5.0 + eps)
     df["ratio_units_vs_prov"] = (df["units"] + 1) / (df["prov_units_median"] + 1)
     df["ratio_units_vs_cpt"]  = (df["units"] + 1) / (df["cpt_units_median"] + 1)
 
@@ -113,47 +106,47 @@ def heuristic_reasons(row):
 
 # ---------- Optional LLM explanations ----------
 def llm_explain_openai(rows_json, model=os.getenv("OPENAI_MODEL","gpt-4o-mini")):
-    from openai import OpenAI
-    client = OpenAI()
-    system = (
-        "You are a healthcare claims auditor. "
-        "Given claim rows with features (amount, units, z-scores, modifiers), "
-        "propose the most likely denial/fraud category and a brief justification. "
-        "Pick from: duplicate, upcoding, unbundling, not_medically_necessary, "
-        "insufficient_documentation, place_of_service_mismatch, other. "
-        "Output STRICT JSON list of objects: "
-        '{"claim_id":..., "deny_reason":"...", "confidence":0-1, "rationale":"..."}'
-    )
-    user = "Analyze these rows:\n" + json.dumps(rows_json)[:12000]
-    resp = client.responses.create(
-        model=model,
-        input=[{"role":"system","content":system},{"role":"user","content":user}],
-        response_format={"type":"json_object"}
-    )
     try:
+        from openai import OpenAI
+        client = OpenAI()
+        system = (
+            "You are a healthcare claims auditor. "
+            "Given claim rows with features (amount, units, z-scores, modifiers), "
+            "propose the most likely denial/fraud category and a brief justification. "
+            "Pick from: duplicate, upcoding, unbundling, not_medically_necessary, "
+            "insufficient_documentation, place_of_service_mismatch, other. "
+            "Output STRICT JSON list of objects: "
+            '{"claim_id":..., "deny_reason":"...", "confidence":0-1, "rationale":"..."}'
+        )
+        user = "Analyze these rows:\n" + json.dumps(rows_json)[:12000]
+        resp = client.responses.create(
+            model=model,
+            input=[{"role":"system","content":system},{"role":"user","content":user}],
+            response_format={"type":"json_object"}
+        )
         data = json.loads(resp.output[0].content[0].text)
-        items = data.get("items", data if isinstance(data, list) else [])
-        return items
+        return data.get("items", data if isinstance(data, list) else [])
     except Exception:
         return []
 
 def llm_explain_anthropic(rows_json, model=os.getenv("ANTHROPIC_MODEL","claude-3-5-sonnet-20240620")):
-    import anthropic, re, json as js
-    client = anthropic.Anthropic()
-    sys = (
-        "You are a healthcare claims auditor. "
-        "Return STRICT JSON as a list of objects "
-        '[{"claim_id":"...","deny_reason":"...","confidence":0-1,"rationale":"..."}]. '
-        "Reasons: duplicate, upcoding, unbundling, not_medically_necessary, "
-        "insufficient_documentation, place_of_service_mismatch, other."
-    )
-    user = "Rows:\n" + json.dumps(rows_json)[:12000]
-    msg = client.messages.create(
-        model=model, max_tokens=800, system=sys, messages=[{"role":"user","content":user}]
-    )
-    txt = "".join([b.text for b in msg.content if hasattr(b, "text")])
-    m = re.search(r"\[.*\]", txt, flags=re.S)
-    return js.loads(m.group(0)) if m else []
+    try:
+        import anthropic, re, json as js
+        client = anthropic.Anthropic()
+        sys = (
+            "You are a healthcare claims auditor. "
+            "Return STRICT JSON as a list of objects "
+            '[{"claim_id":"...","deny_reason":"...","confidence":0-1,"rationale":"..."}]. '
+            "Reasons: duplicate, upcoding, unbundling, not_medically_necessary, "
+            "insufficient_documentation, place_of_service_mismatch, other."
+        )
+        user = "Rows:\n" + json.dumps(rows_json)[:12000]
+        msg = client.messages.create(model=model, max_tokens=800, system=sys, messages=[{"role":"user","content":user}])
+        txt = "".join([b.text for b in msg.content if hasattr(b, "text")])
+        m = re.search(r"\[.*\]", txt, flags=re.S)
+        return js.loads(m.group(0)) if m else []
+    except Exception:
+        return []
 
 # ---------- Public entrypoint ----------
 def score_claims(csv_path, use_llm=False, llm_provider="openai", top_k=50):
@@ -169,25 +162,20 @@ def score_claims(csv_path, use_llm=False, llm_provider="openai", top_k=50):
         top = base_df.sort_values("risk_score", ascending=False).head(min(top_k, len(base_df)))
         cols = ["claim_id","provider_id","member_id","service_date","cpt_code","units","amount",
                 "z_amt_vs_prov","z_amt_vs_cpt","ratio_units_vs_cpt","is_weekend","modifier","reasons"]
-        # Make a copy of just the columns we need
-top_small = top[cols].copy()
-
-# Convert NaN/NaT to None safely (works for strings, numbers, lists)
-top_small = top_small.where(pd.notna(top_small), None)
-
-# Ensure 'reasons' is JSON-serializable (always a list)
-if "reasons" in top_small.columns:
-    top_small["reasons"] = top_small["reasons"].apply(
-        lambda x: x if isinstance(x, list) else ([] if x is None else [str(x)])
-    )
-
-# Convert rows to plain dicts for the LLM
-rows = top_small.to_dict(orient="records")
+        # safe JSON payload
+        top_small = top[cols].copy()
+        top_small = top_small.where(pd.notna(top_small), None)
+        if "reasons" in top_small.columns:
+            top_small["reasons"] = top_small["reasons"].apply(
+                lambda x: x if isinstance(x, list) else ([] if x is None else [str(x)])
+            )
+        rows = top_small.to_dict(orient="records")
 
         if llm_provider == "openai":
             out = llm_explain_openai(rows)
         else:
             out = llm_explain_anthropic(rows)
+
         mapped = {o.get("claim_id"): o for o in out if isinstance(o, dict)}
         base_df["llm_deny_reason"] = base_df["claim_id"].map(lambda cid: mapped.get(cid, {}).get("deny_reason"))
         base_df["llm_confidence"]  = base_df["claim_id"].map(lambda cid: mapped.get(cid, {}).get("confidence"))
